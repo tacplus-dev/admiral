@@ -16,5 +16,5 @@ Design: tacplus-dev/roadmap `decisions/skipper-and-admiral-2026-11-01.md`.
 
 ## Not doing
 - Merging with the operator: the operator stays a separate deterministic service.
-- Fleet actions: the Admiral never asks the operator to act (Jody, 2026-11-19); it reads the deployment's redacted config only.
+- Fleet actions: the Admiral never asks the operator to act (Jody, 2026-11-19); it subscribes to the kernel's redacted deployment config (state read access) only.
 - Any write or token on the LLM's side (the platform rule).
