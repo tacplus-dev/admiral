@@ -11,9 +11,10 @@ Design: tacplus-dev/roadmap `decisions/skipper-and-admiral-2026-11-01.md`.
 - The deterministic filing core: private record in seabeam/triage first, a sanitized public tacplus-dev issue for a platform cause, 90-day evidence purge (#5). Hub, at Jody's request, 2026-11-19.
 
 ## Later
-- Fleet actions (v2): the Admiral asks the operator to act, through the operator's narrow typed API.
+
 - A reporting service in place of the GitLab triage project (REVISIT, Jody 2026-11-19).
 
 ## Not doing
 - Merging with the operator: the operator stays a separate deterministic service.
+- Fleet actions: the Admiral never asks the operator to act (Jody, 2026-11-19); it reads the deployment's redacted config only.
 - Any write or token on the LLM's side (the platform rule).
