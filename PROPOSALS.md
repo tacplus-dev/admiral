@@ -21,3 +21,11 @@ Loopers propose here; Jody decides, and an accepted proposal becomes a ROADMAP l
 - **Three unmaintained crates reach the Admiral only through the generated chassis** (cargo-deny, reported but not
   failing the policy): `chrono` (RUSTSEC-2026-0543), `rustls-pemfile` (RUSTSEC-2025-0134), `unsafe-libyaml`
   (RUSTSEC-2024-0449), as in tacplus-dev/skipper. The fix is tacplus's generator, not this repository.
+- **A wire test of the Skipper-Admiral stream across both builds** (#3): skipper generates its client from
+  `proto/services/admiral.proto` and the Admiral its server, in separate builds. Once intake (#2) and skipper#3 exist,
+  a cross test that opens the stream from the Skipper's generated `Rotating` client to the Admiral's server, across a
+  token rotation and a reconnect with `SkipperHello` cursors, pins that the two generations agree.
+- **`Evidence.trace_events` embeds `trace.TraceEvent`, whose `rpc` is the build's generated `AccountingMethod`** (#3):
+  the Skipper's and the Admiral's builds generate different sets of methods, so an `rpc` the Admiral's build does not
+  know decodes as an unknown field. The design wants trace data typed (its sanitizing generated); if triage (#4) needs
+  the method of every hop, a fleet-wide `AccountingMethod` (tacplus) or a method name beside it is the fix.
