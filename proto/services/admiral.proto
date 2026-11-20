@@ -40,14 +40,43 @@ option (spec.service) = {name: "admiral"};
 // admits the Admiral to llmproxy by this declaration.
 option (spec.grpc_s2s_client) = {service: "llmproxy.LlmProxy"};
 
-// Config is delivered by kernel at startup and on every change. Empty until intake (#2) and the filing core (#5)
-// give it fields; it carries no credential of the cluster's, now or later.
+// Config is delivered by kernel at startup and on every change. It carries no credential of the cluster's, now
+// or later.
 message Config {
   option (spec.grpc_config) = {service_name: "admiral"};
+  // public_repositories is the filing core's allow-list (#5): the tacplus-dev repositories ("tacplus-dev/<name>")
+  // a platform cause may be filed in, in public. Every report gets its private triage record whatever this says;
+  // a platform cause whose repository is not here gets that record only. Empty: nothing is filed in public. A
+  // name outside tacplus-dev refuses the config.
+  repeated string public_repositories = 1 [(spec.assert_max_size) = 512, (spec.assert_element_max_size) = 112];
+
+  // The filing core's credentials (#5, Jody 2026-11-20): names, never secret values. The Admiral's kernel-signed
+  // external token is exchanged through GCP workload identity federation for one service account's, which signs
+  // the tacplus-admiral GitHub App's JWT with a Cloud KMS key (the App's private key, imported non-exportable) and
+  // reads the private triage project's token from Secret Manager (tacplus-dev/cloud#84 makes them). The four names
+  // all set: the Admiral files; none: it triages and files nothing; some: the config is refused.
+  //
+  // wif_provider: the provider that trusts the Admiral's token,
+  // "projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>".
+  string wif_provider = 2 [(spec.assert_max_size) = 256];
+  // wif_audience: the audience the provider accepts on that token. Empty: the provider's own,
+  // "//iam.googleapis.com/" + wif_provider (tacplus-dev/cloud#84's ci stack output admiral.audience).
+  string wif_audience = 3 [(spec.assert_max_size) = 256];
+  // service_account: the account's email.
+  string service_account = 4 [(spec.assert_max_size) = 256];
+  // github_app_key: the App key's version,
+  // "projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>/cryptoKeyVersions/<v>".
+  string github_app_key = 5 [(spec.assert_max_size) = 256];
+  // The tacplus-admiral GitHub App (issues: write, metadata: read on tacplus-dev) and its installation.
+  int64 github_app_id = 6 [(spec.default_int) = 5853599, (spec.assert_ge) = 0];
+  int64 github_installation_id = 7 [(spec.default_int) = 184144753, (spec.assert_ge) = 0];
+  // triage_token_secret: the Secret Manager secret holding the triage project's access token,
+  // "projects/<p>/secrets/<s>" (its latest version is read) or "projects/<p>/secrets/<s>/versions/<v>".
+  string triage_token_secret = 8 [(spec.assert_max_size) = 256];
 }
 
 // AdmiralState is this service's state root, stored in kernel's cluster. Empty: the Admiral keeps no record
-// of its own (the triage record lives in the private triage project, #5). Declared now, not left absent,
+// of its own (the triage record lives in the private triage project, #5, src/filing). Declared now, not left absent,
 // because kernel expects every service in the build to host one.
 message AdmiralState {
   option (spec.service_state) = {label: ["kernel"]};

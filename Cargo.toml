@@ -22,6 +22,14 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.8"
+# The filing core (#5): the forges' REST APIs (src/filing/github.rs, gitlab.rs), and the stable digests its records
+# and public issues are found by (src/filing/render.rs). The generated chassis's lines, so the same crates; its TLS
+# features apply.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+sha2 = "0.11"
+# Its credentials (src/filing/credentials.rs): the GitHub App's JWT, and the KMS signature and Secret Manager payload
+# it reads. The chassis's line.
+base64 = "0.21"
 
 [dev-dependencies]
 # src/api_tests.rs round-trips the API's messages, and checks who may open the stream with the generated
@@ -31,4 +39,3 @@ token = { path = "target/generated-sources/model/chassis/token" }
 key = { path = "target/generated-sources/model/chassis/key" }
 jwk = { path = "target/generated-sources/model/chassis/jwk" }
 grpcserver = { path = "target/generated-sources/model/chassis/grpcserver" }
-base64 = "0.21"

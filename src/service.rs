@@ -13,6 +13,8 @@ use servicemanager::auth::Caller;
 use tonic::Status;
 
 use admiral::core::Triage;
+use admiral::filing::credentials::{GcpCredentials, Sources};
+use admiral::filing::Filing;
 
 use crate::intake::{AdmiralStream, Intake, Skipper, SkipperStream};
 
@@ -36,11 +38,14 @@ impl rpc::AdmiralHandler for SkipperChannel {
 }
 
 /// AdmiralHandler holds no state client, no token handle and no cluster credential; its intake holds the
-/// Skippers' screened reports, in memory, and their triage. The ServiceManager serves the generated surface: the
-/// config watch and the Skipper channel.
+/// Skippers' screened reports, in memory, and their triage, its filing core the forges' clients, and its
+/// credentials the names Config gives their sources. The ServiceManager serves the generated surface: the config
+/// watch and the Skipper channel.
 #[derive(Default)]
 pub struct AdmiralHandler {
     channel: Arc<SkipperChannel>,
+    filing: Option<Arc<Filing>>,
+    credentials: Option<Arc<GcpCredentials>>,
 }
 
 impl AdmiralHandler {
@@ -49,9 +54,15 @@ impl AdmiralHandler {
         Self::default()
     }
 
-    /// An Admiral whose intake triages each report it receives.
-    pub fn with_triage(triage: Arc<Triage>) -> Self {
-        Self { channel: Arc::new(SkipperChannel { intake: Arc::new(Intake::with_triage(triage)) }) }
+    /// An Admiral whose intake triages each report it receives and files it.
+    pub fn with_filing(triage: Arc<Triage>, filing: Arc<Filing>) -> Self {
+        let intake = Arc::new(Intake::with_filing(triage, filing.clone()));
+        Self { channel: Arc::new(SkipperChannel { intake }), filing: Some(filing), credentials: None }
+    }
+
+    /// The filing core's forges' credentials, whose sources Config names.
+    pub fn with_credentials(self, credentials: Arc<GcpCredentials>) -> Self {
+        Self { credentials: Some(credentials), ..self }
     }
 }
 
@@ -61,8 +72,19 @@ impl Handler for AdmiralHandler {
         self.channel.clone()
     }
 
-    // Config has no fields yet (the filing core, #5, gives it some).
-    async fn admiral_config(&self, _cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    // The filing core's credentials' sources, all named or none (a config naming some, or a name that is not one,
+    // is refused and changes nothing), and its allow-list: the tacplus-dev repositories a platform cause may be filed
+    // in, in public. A name that is not one is refused, and the config with it.
+    async fn admiral_config(&self, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
+        let sources = Sources::from_config(cfg)?;
+        if let Some(credentials) = &self.credentials {
+            credentials.configure(sources);
+        }
+        let Some(filing) = &self.filing else { return Ok(()) };
+        let dropped = filing.allow_public(cfg.public_repositories.iter().cloned());
+        if !dropped.is_empty() {
+            return Err(format!("public_repositories: not tacplus-dev repositories: {dropped:?}").into());
+        }
         Ok(())
     }
 
@@ -75,7 +97,13 @@ mod tests {
     use super::{AdmiralHandler, SkipperStream};
     use admiral_model::s2sm::handler::Handler;
     use admiral_model::types::sys::healthreport::healthreport::InstanceStatus;
+    use admiral::core::Triage;
+    use admiral::filing::credentials::{Endpoints, ExternalIdentity, GcpCredentials};
+    use admiral::filing::forge::ForgeError;
+    use admiral::filing::memory::{MemoryProject, MemoryTracker};
+    use admiral::filing::Filing;
     use admiral_model::types::services::admiral::Config;
+    use std::sync::Arc;
     use tonic::Code;
 
     #[test]
@@ -96,6 +124,52 @@ mod tests {
     #[tokio::test]
     async fn it_takes_its_config() {
         AdmiralHandler::new().admiral_config(&Config::default()).await.expect("config applied");
+    }
+
+    #[tokio::test]
+    async fn its_config_names_the_public_repositories_and_only_tacplus_devs() {
+        let filing = Arc::new(Filing::new(Arc::new(MemoryProject::default()), Arc::new(MemoryTracker::default())));
+        let handler = AdmiralHandler::with_filing(Arc::new(Triage::without_model()), filing);
+        let cfg = Config { public_repositories: vec!["tacplus-dev/gateway".to_string()], ..Default::default() };
+        handler.admiral_config(&cfg).await.expect("config applied");
+        let cfg = Config { public_repositories: vec!["someone/gateway".to_string()], ..Default::default() };
+        assert!(handler.admiral_config(&cfg).await.is_err());
+    }
+
+    struct NoKernel;
+
+    #[async_trait::async_trait]
+    impl ExternalIdentity for NoKernel {
+        async fn token_for_external(&self, _audience: &str) -> Result<String, ForgeError> {
+            Err(ForgeError("no kernel in this test".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn its_config_names_the_credentials_sources_all_or_none() {
+        let credentials = Arc::new(GcpCredentials::new(Arc::new(NoKernel), Endpoints::default()));
+        let filing = Arc::new(Filing::new(Arc::new(MemoryProject::default()), Arc::new(MemoryTracker::default())));
+        let triage = Arc::new(Triage::without_model());
+        let handler = AdmiralHandler::with_filing(triage, filing).with_credentials(credentials.clone());
+        let named = Config {
+            wif_provider: "projects/1/locations/global/workloadIdentityPools/p/providers/k".to_string(),
+            service_account: "admiral@tacplus-ci.iam.gserviceaccount.com".to_string(),
+            github_app_key: "projects/c/locations/global/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1".to_string(),
+            github_app_id: 5853599,
+            github_installation_id: 184144753,
+            triage_token_secret: "projects/c/secrets/s/versions/latest".to_string(),
+            ..Default::default()
+        };
+        handler.admiral_config(&named).await.expect("config applied");
+        assert!(credentials.configured());
+        // Some names but not all: refused, and the sources stay as they were.
+        let some = Config { triage_token_secret: String::new(), ..named.clone() };
+        assert!(handler.admiral_config(&some).await.is_err());
+        assert!(credentials.configured());
+        // None: the Admiral files nothing.
+        let none = Config { public_repositories: vec!["tacplus-dev/gateway".to_string()], ..Default::default() };
+        handler.admiral_config(&none).await.expect("config applied");
+        assert!(!credentials.configured());
     }
 
     // The intake's own tests (src/intake.rs) serve the stream; here, the channel takes no stream without the

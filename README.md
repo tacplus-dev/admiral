@@ -35,7 +35,34 @@ and works with no model: it then proposes from the symptom's shape itself, so ev
 reports are grouped by symptom across tenants: the symptom's shape (identifiers and numbers taken out), with keyed
 digests of its reports, so a group holds no tenant data; three reports from two tenants escalate once, as a bug of
 their own (`bug`, `symptom-group`), triaged from the symptom only. The Skipper is sent TRIAGED, GROUPED and
-ESCALATED with the finding; the triage waits, held with the report, for the filing core (#5).
+ESCALATED with the finding.
+
+**Filing** (#5, `src/filing`): the deterministic filing core files what triage proposed, and only after its own
+checks. It runs them whoever proposed: the proposal's own checks again; the target against the allow-list (the
+private triage project, or a tacplus-dev repository named in Config's `public_repositories`); the public issue's
+whole text, evidence and all, for a secret's shape, a tenant identifier, a user's identity or the report's id; and
+duplicates. Every report's full record goes first to the private triage project `seabeam/triage`, as a confidential
+issue: one per report, and a revision updates it. Nothing goes public unless that record is written. A platform
+cause also gets a public issue in its repository. It holds only sanitized evidence: the symptom's shape, the
+reproduction's calls with each request a fixture generated from its shape, the trace events' kinds, services and
+methods, and the versions. It names its record by id only, and the record links it. One cause, by its repository and
+symptom shape, gets one public issue, which every tenant's report of it shares. The Skipper is sent FILED, with the
+public issue's URL when there is one. A record closes when its public issue does. Ninety days after it closed, its
+evidence is purged and its summary kept (`Filing::sweep`, hourly). The forges sit behind traits
+(`src/filing/forge.rs`): GitHub's and GitLab's REST clients, and in-memory fakes for the tests. Every forge call
+carries the trace of the report that caused it (header `X-Tacplus-Trace-Id`).
+
+**The filing core's credentials** (#5, `src/filing/credentials.rs`): no secret in its config, no key in its hands. Its
+kernel-signed external token (`token_for_external`, sub = its SPIFFE id) goes through GCP workload identity
+federation (STS) to one service account. That account signs the `tacplus-admiral` GitHub App's JWT with a Cloud KMS
+key (the App's private key, imported non-exportable), for an hour's installation token, and reads the
+`seabeam/triage` project access token from one Secret Manager secret. Each token is cached until shortly before it
+expires. Config names the sources, never a secret value: `wif_provider` (and `wif_audience`, by default the
+provider's own), `service_account`, `github_app_key` (the key's version), `github_app_id` and
+`github_installation_id` (by default the App's, 5853599 and 184144753), and `triage_token_secret` (a secret, read
+at its latest version, or one of its versions). All of them or none: with none, the Admiral triages and files nothing
+(each filing fails before any forge call and the report stays TRIAGED); with some, the config is refused. The GCP side
+is tacplus-dev/cloud#84: its ci stack's output `admiral` gives each of these names.
 
 **Bring-up:** the operator, then llmproxy (the operator deploys it; the Admiral reaches models only through it),
 then the Admiral. Skippers connect to it once it is up.

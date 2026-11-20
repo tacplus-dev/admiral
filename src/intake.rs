@@ -16,9 +16,11 @@
 //!
 //! Each new report, and each newer revision, is triaged in the background (#4, src/core): its updates TRIAGED, and
 //! GROUPED when it was not reproduced, are held with it and sent on the tenant's open stream; when its symptom
-//! group escalates, every report of the group is sent ESCALATED. The triage is kept with the report for the filing
-//! core (#5). The triage's model calls are caused by the message that brought the report, so they carry its
-//! trace_id (looper#51); the intake makes no other outgoing call.
+//! group escalates, every report of the group is sent ESCALATED. The triage is kept with the report, and the filing
+//! core (#5, src/filing) files it: its private record first, a public issue for a platform cause; the report is
+//! sent FILED, with the public issue's URL when there is one. An escalated group's own bug is filed too. The
+//! triage's model calls and the filing's forge calls are caused by the message that brought the report, so they
+//! carry its trace_id (looper#51); the intake makes no other outgoing call.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -26,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use admiral::core::{Proposed, Reporter, Triage, Triaged};
+use admiral::filing::{Filed, Filing, FilingError};
 use admiral_model::types::services::admiral::{
     admiral_message, skipper_message, AdmiralHello, AdmiralMessage, Report, ReportAccepted, ReportUpdate, SkipperHello,
     SkipperMessage, Stage,
@@ -96,17 +99,25 @@ struct Held {
     updates: Vec<ReportUpdate>,
     /// The triage of the held revision, once it is done.
     triaged: Option<Triaged>,
+    /// The filing of the held revision, once it is done.
+    filed: Option<Filed>,
 }
 
 impl Held {
     /// Adds the report's next update and returns it.
     fn update(&mut self, stage: Stage, proposed: &Proposed) -> ReportUpdate {
+        self.update_with(stage, proposed, String::new())
+    }
+
+    /// Adds the report's next update, naming its public issue, and returns it.
+    fn update_with(&mut self, stage: Stage, proposed: &Proposed, issue_url: String) -> ReportUpdate {
         let update = ReportUpdate {
             report_id: self.report.report_id.clone(),
             seq: self.updates.last().map_or(1, |u| u.seq + 1),
             stage: stage as i32,
             at_ms: now_ms(),
             finding: Some(proposed.finding()),
+            issue_url,
             ..Default::default()
         };
         self.updates.push(update.clone());
@@ -143,6 +154,8 @@ pub struct Intake {
     max_reports: usize,
     /// triage, when the Admiral triages what it receives.
     triage: Option<Arc<Triage>>,
+    /// filing, when the Admiral files what triage proposes.
+    filing: Option<Arc<Filing>>,
     triages: Semaphore,
 }
 
@@ -159,13 +172,20 @@ impl Intake {
             tenants: Mutex::new(HashMap::new()),
             max_reports,
             triage: None,
+            filing: None,
             triages: Semaphore::new(TRIAGES_AT_ONCE),
         }
     }
 
-    /// An intake that triages each report it receives with `triage`.
+    /// An intake that triages each report it receives with `triage` and files none: the triage's own tests.
+    #[cfg(test)]
     pub fn with_triage(triage: Arc<Triage>) -> Self {
         Self { triage: Some(triage), ..Self::default() }
+    }
+
+    /// An intake that triages each report it receives with `triage` and files it with `filing`.
+    pub fn with_filing(triage: Arc<Triage>, filing: Arc<Filing>) -> Self {
+        Self { triage: Some(triage), filing: Some(filing), ..Self::default() }
     }
 
     /// serve takes one Skipper's stream. A newer stream of the same tenant replaces it (latest wins): the
@@ -350,6 +370,7 @@ impl Intake {
             }
             held.report = report.clone();
             held.triaged = None;
+            held.filed = None;
             audit("revised");
             self.triage(skipper, report, trace_id);
             return Ok(vec![accepted]);
@@ -368,14 +389,15 @@ impl Intake {
             at_ms: now_ms(),
             ..Default::default()
         };
-        let held = Held { report: report.clone(), updates: vec![received.clone()], triaged: None };
+        let held = Held { report: report.clone(), updates: vec![received.clone()], triaged: None, filed: None };
         tenant.reports.insert(id.clone(), held);
         audit("received");
         self.triage(skipper, report, trace_id);
         Ok(vec![accepted, message(admiral_message::Body::Update(received))])
     }
 
-    /// Triages a report's revision in the background, if this intake triages; at most TRIAGES_AT_ONCE run at once.
+    /// Triages a report's revision in the background, if this intake triages, and files it, if it files; at most
+    /// TRIAGES_AT_ONCE run at once.
     fn triage(self: &Arc<Self>, skipper: &Skipper, report: Report, trace_id: &str) {
         let Some(triage) = self.triage.clone() else { return };
         let (intake, skipper, trace_id) = (self.clone(), skipper.clone(), trace_id.to_string());
@@ -383,16 +405,68 @@ impl Intake {
             let Ok(_slot) = intake.triages.acquire().await else { return };
             let reporter = Reporter { tenant: &skipper.tenant, tenant_names: &skipper.names };
             let triaged = triage.triage(&trace_id, reporter, &report).await; // propagate
-            intake.triaged(&skipper.tenant, &report, triaged, &triage);
+            let (proposed, escalation) = (triaged.proposed.clone(), triaged.escalation.clone());
+            if !intake.triaged(&skipper.tenant, &report, triaged, &triage) {
+                return;
+            }
+            let Some(filing) = intake.filing.clone() else { return };
+            let filed = filing.file_report(&trace_id, reporter, &report, &proposed).await; // propagate
+            intake.filed(&skipper.tenant, &report, &proposed, filed);
+            if let Some(escalation) = escalation {
+                let filed = filing.file_group(&trace_id, &escalation).await; // propagate
+                audit_group_filing(&skipper.tenant, &filed);
+            }
         });
+    }
+
+    /// Holds a report's filing and tells its Skipper FILED, with the public issue's URL when there is one. A filing
+    /// that failed leaves the report TRIAGED: its next revision, or its sending again, is filed again.
+    fn filed(&self, tenant_key: &str, report: &Report, proposed: &Proposed, filed: Result<Filed, FilingError>) {
+        let mut tenants = self.tenants.lock().unwrap();
+        let Some(tenant) = tenants.get_mut(tenant_key) else { return };
+        let Some(held) = tenant.reports.get_mut(&report.report_id).filter(|h| h.report.revision == report.revision)
+        else {
+            return;
+        };
+        let filed = match filed {
+            Ok(filed) => filed,
+            Err(e) => {
+                tracing::warn!(
+                    target: AUDIT,
+                    tenant = tenant_key,
+                    message = "filing",
+                    report_id = ?report.report_id,
+                    revision = report.revision,
+                    error = %e,
+                    "not filed"
+                );
+                return;
+            }
+        };
+        tracing::info!(
+            target: AUDIT,
+            tenant = tenant_key,
+            message = "filing",
+            report_id = ?report.report_id,
+            revision = report.revision,
+            record = filed.record,
+            public = ?filed.public.as_ref().map(|p| p.url.as_str()),
+            duplicate = filed.duplicate,
+            withheld = ?filed.withheld,
+            "filed"
+        );
+        let url = filed.public.as_ref().map(|p| p.url.clone()).unwrap_or_default();
+        let update = held.update_with(Stage::Filed, proposed, url);
+        held.filed = Some(filed);
+        tenant.send(update);
     }
 
     /// Holds a report's triage and tells its Skipper: TRIAGED, then GROUPED for one not reproduced; and when its
     /// group escalated, ESCALATED to every report of the group, whichever tenant's. A triage of a revision no
     /// longer held is dropped: the newer one's is on its way.
-    fn triaged(&self, tenant_key: &str, report: &Report, triaged: Triaged, triage: &Triage) {
+    fn triaged(&self, tenant_key: &str, report: &Report, triaged: Triaged, triage: &Triage) -> bool {
         let mut tenants = self.tenants.lock().unwrap();
-        let Some(tenant) = tenants.get_mut(tenant_key) else { return };
+        let Some(tenant) = tenants.get_mut(tenant_key) else { return false };
         let Some(held) = tenant.reports.get_mut(&report.report_id).filter(|h| h.report.revision == report.revision)
         else {
             tracing::info!(
@@ -402,7 +476,7 @@ impl Intake {
                 revision = report.revision,
                 "triage dropped: a newer revision is held"
             );
-            return;
+            return false;
         };
         tracing::info!(
             target: AUDIT,
@@ -426,7 +500,7 @@ impl Intake {
         for update in updates {
             tenant.send(update);
         }
-        let Some(escalation) = escalation else { return };
+        let Some(escalation) = escalation else { return true };
         for (key, tenant) in tenants.iter_mut() {
             let mut escalated = Vec::new();
             for (id, held) in tenant.reports.iter_mut() {
@@ -438,6 +512,7 @@ impl Intake {
                 tenant.send(update);
             }
         }
+        true
     }
 
     /// triaged_of is the triage the Admiral holds for a tenant's report, once its held revision is triaged.
@@ -445,9 +520,31 @@ impl Intake {
         self.tenants.lock().unwrap().get(tenant)?.reports.get(report_id)?.triaged.clone()
     }
 
+    /// filed_of is the filing the Admiral holds for a tenant's report, once its held revision is filed.
+    pub fn filed_of(&self, tenant: &str, report_id: &str) -> Option<Filed> {
+        self.tenants.lock().unwrap().get(tenant)?.reports.get(report_id)?.filed.clone()
+    }
+
     /// report_of is the report the Admiral holds for a tenant, as it holds it (screened, its highest revision).
     pub fn report_of(&self, tenant: &str, report_id: &str) -> Option<Report> {
         self.tenants.lock().unwrap().get(tenant)?.reports.get(report_id).map(|h| h.report.clone())
+    }
+}
+
+/// Audits the filing of a symptom group's own bug: the group holds no tenant data, so neither does this line but for
+/// the tenant whose report made it escalate.
+fn audit_group_filing(tenant: &str, filed: &Result<Filed, FilingError>) {
+    match filed {
+        Ok(filed) => tracing::info!(
+            target: AUDIT,
+            tenant,
+            message = "group filing",
+            record = filed.record,
+            public = ?filed.public.as_ref().map(|p| p.url.as_str()),
+            duplicate = filed.duplicate,
+            "filed"
+        ),
+        Err(e) => tracing::warn!(target: AUDIT, tenant, message = "group filing", error = %e, "not filed"),
     }
 }
 
@@ -476,7 +573,11 @@ mod tests {
     };
     use admiral::advisor::model::{Model, ModelError, ModelReply, ModelRequest};
     use admiral::core::proposal::{Label, PRIVATE_TRIAGE};
+    use admiral::advisor::model::ToolUse;
+    use admiral::advisor::PROPOSE_ISSUE;
     use admiral::core::Triage;
+    use admiral::filing::memory::{MemoryProject, MemoryTracker};
+    use admiral::filing::Filing;
     use admiral_model::types::services::admiral::{AdmiralMessage, ReportUpdate};
     use futures::channel::mpsc::{unbounded, UnboundedSender};
     use futures::StreamExt;
@@ -832,5 +933,68 @@ mod tests {
         escalated.sort_by(|a, b| a.report_id.cmp(&b.report_id));
         let got: Vec<(&str, u64, i32)> = escalated.iter().map(|u| (u.report_id.as_str(), u.seq, u.stage)).collect();
         assert_eq!(got, [("r-1", 4, Stage::Escalated as i32), ("r-2", 4, Stage::Escalated as i32)]);
+    }
+
+    fn filing() -> (Arc<MemoryProject>, Arc<MemoryTracker>, Arc<Filing>) {
+        let project = Arc::new(MemoryProject::default());
+        let tracker = Arc::new(MemoryTracker::default());
+        let filing = Arc::new(Filing::new(project.clone(), tracker.clone()));
+        filing.allow_public(["tacplus-dev/gateway".to_string()]);
+        (project, tracker, filing)
+    }
+
+    // The filing core files what triage proposed, its private record first, and the Skipper is told FILED. Its forge
+    // calls are caused by the message that brought the report, so each carries its trace_id (looper#51).
+    #[tokio::test]
+    async fn a_triaged_report_is_filed_and_its_skipper_told() {
+        let (project, tracker, filing) = filing();
+        let intake = Arc::new(Intake::with_filing(Arc::new(Triage::without_model()), filing));
+        let mut s = Stream::open(&intake, skipper("acme"));
+        s.send(hello(&[]));
+        s.body().await;
+        let msg = SkipperMessage { trace_id: "trace-file-1".to_string(), ..report("r-1", 1, "GetOrder fails") };
+        reported(&mut s, msg).await;
+        let filed = update(&mut s).await;
+        assert_eq!((filed.seq, filed.stage), (4, Stage::Filed as i32));
+        assert!(filed.issue_url.is_empty(), "a cause not known to be the platform's has no public issue");
+        let held = intake.filed_of("/tenants/acme", "r-1").expect("filed");
+        assert!(project.record(held.record).expect("its record").body.contains("GetOrder fails"));
+        let traces = project.traces();
+        assert!(!traces.is_empty() && traces.iter().all(|t| t == "trace-file-1"), "{traces:?}");
+        assert!(tracker.calls.lock().unwrap().is_empty());
+    }
+
+    // llmproxy as a confident Opus: every report is the gateway's.
+    struct Gateway;
+
+    #[async_trait::async_trait]
+    impl Model for Gateway {
+        async fn complete(&self, _request: ModelRequest) -> Result<ModelReply, ModelError> {
+            let input = serde_json::json!({
+                "cause": "platform_service", "confidence_percent": 85, "rationale": "the trace fails in the gateway",
+                "target_repository": "tacplus-dev/gateway", "title": "gateway: UNAUTHENTICATED after rotation",
+                "body": "gateway.Gateway/Route answers UNAUTHENTICATED for a token minted after rotation.",
+                "labels": ["wrong-answer"]
+            });
+            Ok(ModelReply::ToolUse(ToolUse { id: "c".to_string(), name: PROPOSE_ISSUE.to_string(), input_json: input.to_string() }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_platform_cause_is_filed_in_public_and_the_skipper_sent_its_url() {
+        let (project, tracker, filing) = filing();
+        let intake = Arc::new(Intake::with_filing(Arc::new(Triage::with_model(Arc::new(Gateway))), filing));
+        let mut s = Stream::open(&intake, skipper("acme"));
+        s.send(hello(&[]));
+        s.body().await;
+        let msg = SkipperMessage { trace_id: "trace-file-2".to_string(), ..report("r-1", 1, "GetOrder fails for acme") };
+        reported(&mut s, msg).await;
+        let filed = update(&mut s).await;
+        assert_eq!(filed.stage, Stage::Filed as i32);
+        assert_eq!(filed.issue_url, "https://github.com/tacplus-dev/gateway/issues/1");
+        let issues = tracker.issues.lock().unwrap();
+        assert!(!issues[0].issue.body.contains("acme"), "{}", issues[0].issue.body);
+        let traces: Vec<String> = project.traces().into_iter().chain(tracker.traces()).collect();
+        assert!(traces.iter().all(|t| t == "trace-file-2"), "{traces:?}");
     }
 }

@@ -51,3 +51,16 @@ Loopers propose here; Jody decides, and an accepted proposal becomes a ROADMAP l
   tacplus-dev/skipper's, copied with the generated crate's name changed. The rule is platform-wide (every LLM-driven
   service), so the gate belongs in one place (tacplus, or the build pipeline) with each repository naming its advisor's
   files.
+- **A failed filing is retried only when the report comes again** (#5): if the private record cannot be written (a
+  forge down, say), the report stays TRIAGED until its next revision or its sending again after a restart. A retry
+  queue, with backoff, in the filing core would file it as soon as the forge is back.
+- **An escalated group's public issue to its reports' Skippers** (#5): the group's own bug is filed (its record and,
+  for a platform cause, its public issue), but the reports of the group are told only ESCALATED, not that issue's
+  URL. A FILED update with the group's `issue_url` to each would close the loop for their reporters.
+- **A revision of a report whose record closed** (#5): the record is found and updated, but it stays closed, and its
+  purge clock runs from its first close. Reopening it (GitLab `state_event: reopen`) when a new revision arrives
+  would keep the evidence the full 90 days after the last close.
+- **The triage project's token is the one long-lived secret left** (#5): GitLab.com takes no outside OIDC token for
+  its API, so the `seabeam/triage` project access token sits in Secret Manager and rotates by hand (at most a year).
+  When GitLab ships inbound workload identity federation (its WIF design doc; gitlab-org/gitlab#601894), the
+  Admiral's own token could be exchanged for it, as the GitHub App's is minted, and the secret dropped.
