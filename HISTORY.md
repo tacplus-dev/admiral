@@ -8,3 +8,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 - 2026-11-20 looper issue Declare the Skipper-Admiral API (the stream's typed messages) for both sides to generate (#3)
 - 2026-11-20 looper issue Report intake: serve the Skippers' streams and receive validated reports (#2)
 - 2026-11-20 looper issue Triage: the LLM proposes a typed issue; group unreproduced reports by symptom (#4)
+- 2026-11-20 looper issue The deterministic filing core: private triage record first, sanitized public tacplus-dev issue for a platform cause (#5)
