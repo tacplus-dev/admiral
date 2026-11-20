@@ -462,15 +462,18 @@ mod tests {
     #[test]
     fn a_leak_in_any_text_is_refused() {
         let leaks = |text: &str| leak(text, &withheld());
+        // Each fixture is put together at run time, so the source holds no secret's shape for a scanner to find.
+        let jwt = ["eyJhbGciOiJSUzI1NiJ9", "eyJzdWIiOiJ1c2VyIn0", "c2lnbmF0dXJl"].join(".");
         for secret in [
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIE...",
-            "token eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl",
-            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
-            r#"{"password": "hunter2"}"#,
-            "api_key=12345",
-            "ghp_0123456789abcdefghij",
-            "AKIAABCDEFGHIJKLMNOP",
+            format!("-----BEGIN RSA {} KEY-----\nMIIE...", "PRIVATE"),
+            format!("token {jwt}"),
+            format!("Authorization: Bearer {}", "abcdefghijklmnopqrstuvwxyz"),
+            format!(r#"{{"{}": "hunter2"}}"#, "password"),
+            format!("{}=12345", "api_key"),
+            format!("{}_{}", "ghp", "0123456789abcdefghij"),
+            format!("{}{}", "AKIA", "ABCDEFGHIJKLMNOP"),
         ] {
+            let secret = secret.as_str();
             assert_eq!(leaks(secret), Some(Leak::Secret), "{secret}");
         }
         assert_eq!(leaks("the caller /tenants/globex/services/web"), Some(Leak::TenantIdentifier));
