@@ -12,23 +12,27 @@
 //!
 //! The Admiral holds a tenant's reports in memory, the highest revision of each, with the updates it sent: a
 //! Skipper that reconnects names its open reports in its hello and is sent the updates it missed, and one the
-//! Admiral holds no record of (after a restart, say) it is told to send again. Triage (#4) takes the reports from
-//! here; until it does, a report's one update is RECEIVED.
+//! Admiral holds no record of (after a restart, say) it is told to send again.
 //!
-//! The intake makes no outgoing call, so there is no trace_id to carry onto one (looper#51).
+//! Each new report, and each newer revision, is triaged in the background (#4, src/core): its updates TRIAGED, and
+//! GROUPED when it was not reproduced, are held with it and sent on the tenant's open stream; when its symptom
+//! group escalates, every report of the group is sent ESCALATED. The triage is kept with the report for the filing
+//! core (#5). The triage's model calls are caused by the message that brought the report, so they carry its
+//! trace_id (looper#51); the intake makes no other outgoing call.
 
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use admiral::core::{Proposed, Reporter, Triage, Triaged};
 use admiral_model::types::services::admiral::{
     admiral_message, skipper_message, AdmiralHello, AdmiralMessage, Report, ReportAccepted, ReportUpdate, SkipperHello,
     SkipperMessage, Stage,
 };
 use futures::StreamExt;
 use servicemanager::auth::Caller;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tonic::Status;
 
 use crate::screen::{screen, OwnTenant};
@@ -41,6 +45,10 @@ pub const MAX_REPORTS_PER_TENANT: usize = 4096;
 
 /// How many messages to a Skipper may wait to be sent before the stream's reader waits for them.
 const OUTBOUND: usize = 64;
+
+/// How many reports are triaged at once: each is up to a few model calls, so this bounds the Admiral's model spend
+/// however fast the Skippers send.
+pub const TRIAGES_AT_ONCE: usize = 4;
 
 const AUDIT: &str = "admiral::audit";
 
@@ -86,7 +94,27 @@ fn tenant_segment(path: &str) -> Option<&str> {
 struct Held {
     report: Report,
     updates: Vec<ReportUpdate>,
+    /// The triage of the held revision, once it is done.
+    triaged: Option<Triaged>,
 }
+
+impl Held {
+    /// Adds the report's next update and returns it.
+    fn update(&mut self, stage: Stage, proposed: &Proposed) -> ReportUpdate {
+        let update = ReportUpdate {
+            report_id: self.report.report_id.clone(),
+            seq: self.updates.last().map_or(1, |u| u.seq + 1),
+            stage: stage as i32,
+            at_ms: now_ms(),
+            finding: Some(proposed.finding()),
+            ..Default::default()
+        };
+        self.updates.push(update.clone());
+        update
+    }
+}
+
+type Outbound = mpsc::Sender<Result<AdmiralMessage, Status>>;
 
 #[derive(Default)]
 struct Tenant {
@@ -94,13 +122,28 @@ struct Tenant {
     stream: u64,
     /// close ends the open stream when a newer one replaces it.
     close: Option<oneshot::Sender<()>>,
+    /// outbound sends on the open stream, for the updates triage makes after the message that caused them.
+    outbound: Option<Outbound>,
     reports: HashMap<String, Held>,
+}
+
+impl Tenant {
+    /// Sends `update` on the open stream, if there is one with room: a Skipper that misses it is sent it again
+    /// after its next hello, which names the last seq it holds.
+    fn send(&self, update: ReportUpdate) {
+        if let Some(outbound) = &self.outbound {
+            let _ = outbound.try_send(Ok(message(admiral_message::Body::Update(update))));
+        }
+    }
 }
 
 /// Intake holds what the Skippers sent, per tenant, and serves their streams.
 pub struct Intake {
     tenants: Mutex<HashMap<String, Tenant>>,
     max_reports: usize,
+    /// triage, when the Admiral triages what it receives.
+    triage: Option<Arc<Triage>>,
+    triages: Semaphore,
 }
 
 impl Default for Intake {
@@ -110,8 +153,19 @@ impl Default for Intake {
 }
 
 impl Intake {
+    /// An intake that holds reports and triages none: a report's one update is RECEIVED.
     pub fn with_limit(max_reports: usize) -> Self {
-        Self { tenants: Mutex::new(HashMap::new()), max_reports }
+        Self {
+            tenants: Mutex::new(HashMap::new()),
+            max_reports,
+            triage: None,
+            triages: Semaphore::new(TRIAGES_AT_ONCE),
+        }
+    }
+
+    /// An intake that triages each report it receives with `triage`.
+    pub fn with_triage(triage: Arc<Triage>) -> Self {
+        Self { triage: Some(triage), ..Self::default() }
     }
 
     /// serve takes one Skipper's stream. A newer stream of the same tenant replaces it (latest wins): the
@@ -126,6 +180,7 @@ impl Intake {
             if let Some(old) = tenant.close.replace(close_tx) {
                 let _ = old.send(());
             }
+            tenant.outbound = Some(tx.clone());
             tenant.stream
         };
         tracing::info!(target: AUDIT, tenant = %skipper.tenant, stream, "opened");
@@ -186,13 +241,19 @@ impl Intake {
         if let Some(tenant) = tenants.get_mut(&skipper.tenant) {
             if tenant.stream == stream {
                 tenant.close = None;
+                tenant.outbound = None;
             }
         }
     }
 
     /// receive takes one message of a Skipper's stream, already validated, and answers it. `hello` is whether
     /// the stream's hello came. An error ends the stream.
-    pub fn receive(&self, skipper: &Skipper, hello: &mut bool, msg: SkipperMessage) -> Result<Vec<AdmiralMessage>, Status> {
+    pub fn receive(
+        self: &Arc<Self>,
+        skipper: &Skipper,
+        hello: &mut bool,
+        msg: SkipperMessage,
+    ) -> Result<Vec<AdmiralMessage>, Status> {
         let tenant = skipper.tenant.as_str();
         let Some(body) = msg.body else {
             if msg.last {
@@ -214,7 +275,7 @@ impl Intake {
                 tracing::warn!(target: AUDIT, tenant, message = kind(&body), "refused: before the hello");
                 Err(Status::failed_precondition("a Skipper's first message is its SkipperHello"))
             }
-            skipper_message::Body::Report(r) => self.report(skipper, r),
+            skipper_message::Body::Report(r) => self.report(skipper, r, &msg.trace_id),
             skipper_message::Body::Answer(a) => {
                 // The Admiral sends no request yet (triage, #4, will): an answer answers nothing it asked.
                 tracing::warn!(target: AUDIT, tenant, message = "answer", request_id = ?a.request_id, "ignored: no such request");
@@ -253,7 +314,12 @@ impl Intake {
         replies
     }
 
-    fn report(&self, skipper: &Skipper, mut report: Report) -> Result<Vec<AdmiralMessage>, Status> {
+    fn report(
+        self: &Arc<Self>,
+        skipper: &Skipper,
+        mut report: Report,
+        trace_id: &str,
+    ) -> Result<Vec<AdmiralMessage>, Status> {
         let found = screen(&mut report, &OwnTenant::new(skipper.names.iter().cloned()));
         let (id, revision) = (report.report_id.clone(), report.revision);
         let audit = |outcome: &str| {
@@ -282,8 +348,10 @@ impl Intake {
                 audit("held already");
                 return Ok(vec![accepted]);
             }
-            held.report = report;
+            held.report = report.clone();
+            held.triaged = None;
             audit("revised");
+            self.triage(skipper, report, trace_id);
             return Ok(vec![accepted]);
         }
         if tenant.reports.len() >= self.max_reports {
@@ -300,9 +368,81 @@ impl Intake {
             at_ms: now_ms(),
             ..Default::default()
         };
-        tenant.reports.insert(id.clone(), Held { report, updates: vec![received.clone()] });
+        let held = Held { report: report.clone(), updates: vec![received.clone()], triaged: None };
+        tenant.reports.insert(id.clone(), held);
         audit("received");
+        self.triage(skipper, report, trace_id);
         Ok(vec![accepted, message(admiral_message::Body::Update(received))])
+    }
+
+    /// Triages a report's revision in the background, if this intake triages; at most TRIAGES_AT_ONCE run at once.
+    fn triage(self: &Arc<Self>, skipper: &Skipper, report: Report, trace_id: &str) {
+        let Some(triage) = self.triage.clone() else { return };
+        let (intake, skipper, trace_id) = (self.clone(), skipper.clone(), trace_id.to_string());
+        tokio::spawn(async move {
+            let Ok(_slot) = intake.triages.acquire().await else { return };
+            let reporter = Reporter { tenant: &skipper.tenant, tenant_names: &skipper.names };
+            let triaged = triage.triage(&trace_id, reporter, &report).await; // propagate
+            intake.triaged(&skipper.tenant, &report, triaged, &triage);
+        });
+    }
+
+    /// Holds a report's triage and tells its Skipper: TRIAGED, then GROUPED for one not reproduced; and when its
+    /// group escalated, ESCALATED to every report of the group, whichever tenant's. A triage of a revision no
+    /// longer held is dropped: the newer one's is on its way.
+    fn triaged(&self, tenant_key: &str, report: &Report, triaged: Triaged, triage: &Triage) {
+        let mut tenants = self.tenants.lock().unwrap();
+        let Some(tenant) = tenants.get_mut(tenant_key) else { return };
+        let Some(held) = tenant.reports.get_mut(&report.report_id).filter(|h| h.report.revision == report.revision)
+        else {
+            tracing::info!(
+                target: AUDIT,
+                tenant = tenant_key,
+                report_id = ?report.report_id,
+                revision = report.revision,
+                "triage dropped: a newer revision is held"
+            );
+            return;
+        };
+        tracing::info!(
+            target: AUDIT,
+            tenant = tenant_key,
+            message = "triage",
+            report_id = ?report.report_id,
+            revision = report.revision,
+            by = ?triaged.proposed.by,
+            cause = ?triaged.proposed.issue.cause,
+            target_repository = %triaged.proposed.issue.target_repository,
+            grouped = ?triaged.grouped.as_ref().map(|g| g.reports),
+            escalated = triaged.escalation.is_some(),
+            "triaged"
+        );
+        let mut updates = vec![held.update(Stage::Triaged, &triaged.proposed)];
+        if triaged.grouped.is_some() {
+            updates.push(held.update(Stage::Grouped, &triaged.proposed));
+        }
+        let escalation = triaged.escalation.clone();
+        held.triaged = Some(triaged);
+        for update in updates {
+            tenant.send(update);
+        }
+        let Some(escalation) = escalation else { return };
+        for (key, tenant) in tenants.iter_mut() {
+            let mut escalated = Vec::new();
+            for (id, held) in tenant.reports.iter_mut() {
+                if triage.in_group(&escalation.group.key, key, id) {
+                    escalated.push(held.update(Stage::Escalated, &escalation.proposed));
+                }
+            }
+            for update in escalated {
+                tenant.send(update);
+            }
+        }
+    }
+
+    /// triaged_of is the triage the Admiral holds for a tenant's report, once its held revision is triaged.
+    pub fn triaged_of(&self, tenant: &str, report_id: &str) -> Option<Triaged> {
+        self.tenants.lock().unwrap().get(tenant)?.reports.get(report_id)?.triaged.clone()
     }
 
     /// report_of is the report the Admiral holds for a tenant, as it holds it (screened, its highest revision).
@@ -334,11 +474,14 @@ mod tests {
         admiral_message, skipper_message, Classification, ReportCursor, Report, Reproduction, RequestAnswer, SkipperHello,
         SkipperMessage, Stage, Symptom,
     };
-    use admiral_model::types::services::admiral::AdmiralMessage;
+    use admiral::advisor::model::{Model, ModelError, ModelReply, ModelRequest};
+    use admiral::core::proposal::{Label, PRIVATE_TRIAGE};
+    use admiral::core::Triage;
+    use admiral_model::types::services::admiral::{AdmiralMessage, ReportUpdate};
     use futures::channel::mpsc::{unbounded, UnboundedSender};
     use futures::StreamExt;
     use servicemanager::auth::Caller;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tonic::{Code, Status};
 
     fn caller(subject: &str, namespace: &str) -> Caller {
@@ -594,5 +737,100 @@ mod tests {
         assert!(matches!(s.body().await, admiral_message::Body::Accepted(_)));
         s.send(report("r-2", 1, "x"));
         assert_eq!(s.status().await.code(), Code::ResourceExhausted);
+    }
+
+    // llmproxy as a recorder: it records each call's trace, and answers with no proposal, so the core proposes.
+    #[derive(Default)]
+    struct Traces(Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl Model for Traces {
+        async fn complete(&self, request: ModelRequest) -> Result<ModelReply, ModelError> {
+            self.0.lock().unwrap().push(request.trace_id);
+            Err(ModelError("not routed in this test".to_string()))
+        }
+    }
+
+    async fn update(s: &mut Stream) -> ReportUpdate {
+        match s.body().await {
+            admiral_message::Body::Update(u) => u,
+            other => panic!("not an update: {other:?}"),
+        }
+    }
+
+    /// Sends a report no Skipper reproduced and reads what it is answered: accepted, then RECEIVED, TRIAGED and
+    /// GROUPED.
+    async fn reported(s: &mut Stream, msg: SkipperMessage) -> Vec<ReportUpdate> {
+        s.send(msg);
+        assert!(matches!(s.body().await, admiral_message::Body::Accepted(_)));
+        vec![update(s).await, update(s).await, update(s).await]
+    }
+
+    #[tokio::test]
+    async fn a_report_is_triaged_and_its_skipper_told() {
+        let intake = Arc::new(Intake::with_triage(Arc::new(Triage::without_model())));
+        let mut s = Stream::open(&intake, skipper("acme"));
+        s.send(hello(&[]));
+        s.body().await;
+        let updates = reported(&mut s, report("r-1", 1, "GetOrder fails")).await;
+        let stages: Vec<(u64, i32)> = updates.iter().map(|u| (u.seq, u.stage)).collect();
+        assert_eq!(
+            stages,
+            [(1, Stage::Received as i32), (2, Stage::Triaged as i32), (3, Stage::Grouped as i32)],
+            "{updates:?}"
+        );
+        let finding = updates[1].finding.clone().expect("a finding");
+        assert_eq!(finding.classification.expect("classified").component, PRIVATE_TRIAGE);
+        let triaged = intake.triaged_of("/tenants/acme", "r-1").expect("triaged");
+        assert_eq!(triaged.proposed.issue.labels, [Label::NotYetReproduced]);
+        assert_eq!(triaged.grouped.map(|g| g.reports), Some(1));
+
+        // A Skipper that reconnects is sent the triage's updates it missed.
+        let mut s = Stream::open(&intake, skipper("acme"));
+        s.send(hello(&[("r-1", 1)]));
+        s.body().await;
+        assert_eq!(update(&mut s).await.stage, Stage::Triaged as i32);
+        assert_eq!(update(&mut s).await.stage, Stage::Grouped as i32);
+    }
+
+    // Trace propagation (tacplus-dev/looper#51): the triage's calls to llmproxy are caused by the message that
+    // brought the report, so each carries its trace_id.
+    #[tokio::test]
+    async fn the_triage_carries_the_reports_trace_id() {
+        let model = Arc::new(Traces::default());
+        let intake = Arc::new(Intake::with_triage(Arc::new(Triage::with_model(model.clone()))));
+        let mut s = Stream::open(&intake, skipper("acme"));
+        s.send(hello(&[]));
+        s.body().await;
+        let msg = SkipperMessage { trace_id: "trace-report-1".to_string(), ..report("r-1", 1, "GetOrder fails") };
+        reported(&mut s, msg).await;
+        let traces = model.0.lock().unwrap().clone();
+        assert!(!traces.is_empty());
+        assert!(traces.iter().all(|t| t == "trace-report-1"), "{traces:?}");
+    }
+
+    // Several reports of one symptom no Skipper could reproduce, from two tenants, escalate: every report of the
+    // group is told, each on its own tenant's stream.
+    #[tokio::test]
+    async fn an_escalation_reaches_every_report_of_its_group() {
+        let intake = Arc::new(Intake::with_triage(Arc::new(Triage::without_model())));
+        let mut acme = Stream::open(&intake, skipper("acme"));
+        acme.send(hello(&[]));
+        acme.body().await;
+        let mut beta = Stream::open(&intake, skipper("beta"));
+        beta.send(hello(&[]));
+        beta.body().await;
+
+        reported(&mut acme, report("r-1", 1, "x")).await;
+        reported(&mut acme, report("r-2", 1, "y")).await;
+        reported(&mut beta, report("r-1", 1, "z")).await;
+        let escalated = update(&mut beta).await;
+        assert_eq!((escalated.seq, escalated.stage), (4, Stage::Escalated as i32));
+        assert!(intake.triaged_of("/tenants/beta", "r-1").expect("triaged").escalation.is_some());
+
+        let mut escalated = vec![update(&mut acme).await, update(&mut acme).await];
+        escalated.sort_by(|a, b| a.report_id.cmp(&b.report_id));
+        let got: Vec<(&str, u64, i32)> = escalated.iter().map(|u| (u.report_id.as_str(), u.seq, u.stage)).collect();
+        assert_eq!(got, [("r-1", 4, Stage::Escalated as i32), ("r-2", 4, Stage::Escalated as i32)]);
     }
 }

@@ -10,6 +10,8 @@ mod service;
 use std::error::Error;
 use std::sync::Arc;
 
+use admiral::core::llmproxy::LlmProxyModel;
+use admiral::core::Triage;
 use admiral_model::s2sm::ServiceManager;
 
 #[tokio::main]
@@ -37,5 +39,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // service has its /system identity and config. sm.run() then serves the generated gRPC surface and
     // blocks until shutdown.
     let sm = Arc::new(ServiceManager::new().await?);
-    sm.run(Arc::new(service::AdmiralHandler::new())).await
+    // Triage's core holds the ServiceManager, and with it the llmproxy client; its advisor reaches the model through
+    // it (Opus, and Fable for hard triage) and gets nothing else (src/advisor, scripts/llm-rule-gate.sh).
+    let triage = Arc::new(Triage::with_model(Arc::new(LlmProxyModel::new(sm.clone()))));
+    sm.run(Arc::new(service::AdmiralHandler::with_triage(triage))).await
 }

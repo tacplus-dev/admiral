@@ -72,10 +72,10 @@ pub struct Triaged {
     pub escalation: Option<Escalation>,
 }
 
-impl Triaged {
-    /// The finding the Skipper is told (ReportUpdate.finding, at STAGE_TRIAGED).
+impl Proposed {
+    /// The finding a Skipper is told (ReportUpdate.finding): where the cause is, how sure, and the issue's title.
     pub fn finding(&self) -> api::Finding {
-        let issue = &self.proposed.issue;
+        let issue = &self.issue;
         api::Finding {
             classification: Some(api::Classification {
                 cause: wire_cause(issue.cause) as i32,
@@ -87,6 +87,13 @@ impl Triaged {
             summary: issue.title.clone(),
             ..Default::default()
         }
+    }
+}
+
+impl Triaged {
+    /// The report's finding, told its Skipper at STAGE_TRIAGED.
+    pub fn finding(&self) -> api::Finding {
+        self.proposed.finding()
     }
 }
 
@@ -160,6 +167,11 @@ impl Triage {
     /// Takes a report out of its symptom group (it closed).
     pub fn forget(&self, tenant: &str, report_id: &str) {
         self.groups.lock().unwrap().remove(tenant, report_id);
+    }
+
+    /// Whether a tenant's report is in the symptom group of `key`: who to tell that the group escalated.
+    pub fn in_group(&self, key: &SymptomKey, tenant: &str, report_id: &str) -> bool {
+        self.groups.lock().unwrap().contains(key, tenant, report_id)
     }
 
     /// A group's own bug: its symptom only, triaged as hard. The trace is that of the report that made the group

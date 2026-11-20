@@ -7,8 +7,6 @@ Loopers propose here; Jody decides, and an accepted proposal becomes a ROADMAP l
 - **The Admiral in the fleets' manifests, after llmproxy** (the bring-up order: operator, llmproxy, Admiral;
   tacplus-dev/roadmap decisions/skipper-and-admiral-2026-11-01.md): a change in the fleet repositories, once there is
   an image.
-- **The LLM-rule build gate here** (the 2026-11-19 addendum: the advisor's module gets no state client and no token
-  handle, and a gate fails the build if it imports one): with the triage advisor (#4), extend `just system`.
 - **CI workflows** (#1): `.github/workflows/ci.yml` running `just gates` (rustup stable, `protobuf-compiler` and
   `just` from apt, `TACPLUS_BIN=ci/tacplus.sh`), and `planning-files.yml` calling
   `tacplus-dev/looper/.github/workflows/planning-files.yml@main` (HISTORY.md says CI enforces it append-only), as
@@ -35,6 +33,21 @@ Loopers propose here; Jody decides, and an accepted proposal becomes a ROADMAP l
 - **A per-stream message rate and a hello deadline in the intake** (#2): a stream is bounded per message and a
   tenant's held reports to 4096, but a Skipper may send revisions as fast as it likes, and a stream that never sends
   its hello stays open. Rate-limit per tenant and close a stream with no hello within a deadline.
-- **Nonce-keyed provenance blocks for the triage advisor** (#4): the intake screens and holds a report but gives no
-  LLM any of its text. The advisor is where report text first meets a model; it must reach it only inside nonce-keyed
-  blocks (tacplus-dev/looper#40), with the intake's screening counts beside it.
+- **The intake's screening counts beside the triage advisor's report block** (#2, #4): the advisor reads a report
+  only inside its nonce-keyed block (done, #4), but not how many fields the intake redacted; a report that needed
+  redacting is evidence the model could weigh.
+- **A `claude-fable-latest` route in the fleets' llmproxy config** (#4): hard triage asks llmproxy for that alias
+  (the 2026-11-19 defaults: Fable for hard triage), and llmproxy's README routes only `claude-opus-latest` among
+  Anthropic's. Until a fleet routes it (`latest_pattern` for Anthropic's Fable line), a hard triage keeps Opus's
+  proposal or the core's own. A change in the fleet repositories.
+- **Triage's model aliases and escalation thresholds in Config** (#4): `claude-opus-latest`, `claude-fable-latest`,
+  the 50% hard-triage line, three reports from two tenants and four triages at once are constants
+  (`src/advisor/mod.rs`, `src/core/mod.rs`, `src/core/symptoms.rs`, `src/intake.rs`). A deployment may want its
+  own; Config fields with these defaults, applied in `admiral_config`.
+- **Symptom groups outlive a restart** (#4): they are in memory, like the intake's reports, so a restart starts
+  them empty and the Skippers' resent reports regroup only those still open. Once the filing core (#5) keeps the
+  private records, rebuild the groups from the open "not yet reproduced" ones.
+- **One LLM-rule gate for the platform** (#4): `scripts/llm-rule-gate.sh` and its fixture test are
+  tacplus-dev/skipper's, copied with the generated crate's name changed. The rule is platform-wide (every LLM-driven
+  service), so the gate belongs in one place (tacplus, or the build pipeline) with each repository naming its advisor's
+  files.

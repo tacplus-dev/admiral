@@ -23,6 +23,20 @@ each message is validated against the declared bounds, a report is screened agai
 identifiers and users' identities (`src/screen.rs`) and held in memory, its highest revision, and every message is
 audited (log target `admiral::audit`, never a message's text).
 
+**Triage** (#4, `src/core`, `src/advisor`): each report and each newer revision is triaged in the background, at most
+four at once. The advisor reads the report only inside a block keyed with a nonce drawn for that triage, and
+proposes a typed issue with its one tool, `propose_issue`: the cause (the tenant's code, a platform service, the
+generator, unknown), a target repository that must fit it (`tacplus-dev/<service>`, `tacplus-dev/tacplus` for the
+generator, `seabeam/triage` otherwise), a one-line title, a body refused if it holds a secret's shape, a tenant
+identifier or a user's identity, and allow-listed labels. It asks llmproxy for `claude-opus-latest`, and for
+`claude-fable-latest` when the triage is hard (Opus gave no proposal or was under 50% sure, or a symptom group
+escalates). The core validates the proposal again, adds the label validation sets (`bug`, or `not yet reproduced`),
+and works with no model: it then proposes from the symptom's shape itself, so every report surfaces. Unreproduced
+reports are grouped by symptom across tenants: the symptom's shape (identifiers and numbers taken out), with keyed
+digests of its reports, so a group holds no tenant data; three reports from two tenants escalate once, as a bug of
+their own (`bug`, `symptom-group`), triaged from the symptom only. The Skipper is sent TRIAGED, GROUPED and
+ESCALATED with the finding; the triage waits, held with the report, for the filing core (#5).
+
 **Bring-up:** the operator, then llmproxy (the operator deploys it; the Admiral reaches models only through it),
 then the Admiral. Skippers connect to it once it is up.
 
@@ -32,6 +46,9 @@ then the Admiral. Skippers connect to it once it is up.
 
 - `just system`: the proto never declares the Admiral tenant-owned, and it builds no Kubernetes client (it holds no
   cluster credentials).
+- `just llm-rule`: an LLM may propose, never hold a token or a write path (the 2026-11-19 addendum).
+  `scripts/llm-rule-gate.sh`, after its fixture test, fails if the advisor's side (`src/advisor/`,
+  `src/core/proposal.rs`) names the generated model, a chassis crate, a token or client, or a way out of the process.
 - `just test`: `tacplus build` (which must leave every tracked file as it was), `cargo build --locked`,
   `cargo test --locked`.
 

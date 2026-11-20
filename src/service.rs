@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The Admiral's lifecycle handler and its Skipper-facing surface: the Skipper channel, served by the report
-//! intake (#2, src/intake.rs).
+//! intake (#2, src/intake.rs), which triages what it receives (#4, src/core).
 
 use std::sync::Arc;
 
@@ -11,6 +11,8 @@ use admiral_model::s2sm::internal::grpc::servers::services::admiral::admiral as 
 use admiral_model::types::services::admiral::Config;
 use servicemanager::auth::Caller;
 use tonic::Status;
+
+use admiral::core::Triage;
 
 use crate::intake::{AdmiralStream, Intake, Skipper, SkipperStream};
 
@@ -34,16 +36,22 @@ impl rpc::AdmiralHandler for SkipperChannel {
 }
 
 /// AdmiralHandler holds no state client, no token handle and no cluster credential; its intake holds the
-/// Skippers' screened reports, in memory. The ServiceManager serves the generated surface: the config watch and
-/// the Skipper channel.
+/// Skippers' screened reports, in memory, and their triage. The ServiceManager serves the generated surface: the
+/// config watch and the Skipper channel.
 #[derive(Default)]
 pub struct AdmiralHandler {
     channel: Arc<SkipperChannel>,
 }
 
 impl AdmiralHandler {
+    /// An Admiral that holds reports and triages none.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An Admiral whose intake triages each report it receives.
+    pub fn with_triage(triage: Arc<Triage>) -> Self {
+        Self { channel: Arc::new(SkipperChannel { intake: Arc::new(Intake::with_triage(triage)) }) }
     }
 }
 
