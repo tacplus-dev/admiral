@@ -1,0 +1,35 @@
+// admiral: a deployment's platform agent, one per deployment, in /system.
+//
+// Design: tacplus-dev/roadmap decisions/skipper-and-admiral-2026-11-01.md (its 2026-11-19 addenda).
+//
+// SERVICE CLASS: a platform service, NOT tenant-owned: (spec.service) below leaves tenant_owned unset, so the
+// operator runs one instance per deployment with the identity /system/services/admiral. A tenant may not talk
+// to it; a Skipper reaches it over the stream the Skipper opens (tenant -> /system, the allowed direction).
+//
+// What it never holds: tenant data (a report it receives carries the Skipper's validated evidence only) and
+// cluster credentials (it never acts on the fleet; it only reads the deployment's redacted config). A prompt
+// injection through a Skipper's message must land in a process with neither.
+//
+// SCOPE OF THIS FILE, THE SCAFFOLD ONLY (#1): the service's identity, its Config and its state root. The
+// Skipper-Admiral stream and its typed messages are #3; intake, triage and filing (#2, #4, #5) follow.
+
+syntax = "proto3";
+
+package admiral;
+
+import "sys/spec.proto";
+
+option (spec.service) = {name: "admiral"};
+
+// Config is delivered by kernel at startup and on every change. Empty until the API (#3) and the filing
+// core (#5) give it fields; it carries no credential of the cluster's, now or later.
+message Config {
+  option (spec.grpc_config) = {service_name: "admiral"};
+}
+
+// AdmiralState is this service's state root, stored in kernel's cluster. Empty: the Admiral keeps no record
+// of its own (the triage record lives in the private triage project, #5). Declared now, not left absent,
+// because kernel expects every service in the build to host one.
+message AdmiralState {
+  option (spec.service_state) = {label: ["kernel"]};
+}

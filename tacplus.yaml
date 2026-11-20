@@ -1,0 +1,11 @@
+kind: service
+# The compiler line this repository builds with: the looper runs its latest patch.
+tacplus: "2.6"
+language: rust
+# Rust crate is <last segment>-model, matching Cargo.toml (admiral-model).
+pkg: com.github.tacplusdev.admiral
+output-dir: target/generated-sources
+src: proto
+header: |
+  Copyright (c) 2026 Jody Scott
+  SPDX-License-Identifier: Apache-2.0

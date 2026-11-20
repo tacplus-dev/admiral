@@ -1,3 +1,23 @@
 # Proposals: admiral
 
 Loopers propose here; Jody decides, and an accepted proposal becomes a ROADMAP line.
+
+- **A release image and release workflow** (Dockerfile, `release.yml`, as llmproxy's: non-root 65532, base by digest,
+  the launcher pinned), so a fleet can run the Admiral. Not part of the scaffold (#1): nothing deploys it yet.
+- **The Admiral in the fleets' manifests, after llmproxy** (the bring-up order: operator, llmproxy, Admiral;
+  tacplus-dev/roadmap decisions/skipper-and-admiral-2026-11-01.md): a change in the fleet repositories, once there is
+  an image.
+- **The LLM-rule build gate here** (the 2026-11-19 addendum: the advisor's module gets no state client and no token
+  handle, and a gate fails the build if it imports one): with the triage advisor (#4), extend `just system`.
+- **CI workflows** (#1): `.github/workflows/ci.yml` running `just gates` (rustup stable, `protobuf-compiler` and
+  `just` from apt, `TACPLUS_BIN=ci/tacplus.sh`), and `planning-files.yml` calling
+  `tacplus-dev/looper/.github/workflows/planning-files.yml@main` (HISTORY.md says CI enforces it append-only), as
+  llmproxy has them. The looper's credential may not push `.github/workflows/`: a person adds them.
+- **Drop the generated crates' license clarifications** (#1): tacplus 2.6.13 writes no `license` into the manifests of
+  the 22 crates it generates (the chassis and `admiral-model`), so `deny.toml` clarifies each as Apache-2.0, the SPDX
+  header tacplus.yaml puts on every generated file, as tacplus-dev/skipper does. The fix is the generator's
+  (tacplus-dev/tacplus#368, its 2.6 backport tacplus-dev/tacplus#390): once `tacplus.lock` pins the 2.6 patch carrying
+  it, delete the `[[licenses.clarify]]` entries.
+- **Three unmaintained crates reach the Admiral only through the generated chassis** (cargo-deny, reported but not
+  failing the policy): `chrono` (RUSTSEC-2026-0543), `rustls-pemfile` (RUSTSEC-2025-0134), `unsafe-libyaml`
+  (RUSTSEC-2024-0449), as in tacplus-dev/skipper. The fix is tacplus's generator, not this repository.
