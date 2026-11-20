@@ -5,6 +5,9 @@ language: rust
 # Rust crate is <last segment>-model, matching Cargo.toml (admiral-model).
 pkg: com.github.tacplusdev.admiral
 output-dir: target/generated-sources
+# Triage reaches its model only through llmproxy, over S2S (#4); its contract comes through the registry.
+depends:
+  - llmproxy
 src: proto
 header: |
   Copyright (c) 2026 Jody Scott

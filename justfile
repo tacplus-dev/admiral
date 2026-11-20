@@ -43,5 +43,12 @@ system:
   kube="$(grep -E '^name = "(kube|kube-client|kube-runtime|k8s-openapi)"$' Cargo.lock || true)"
   test -z "$kube" || { echo "system: the Admiral holds no cluster credentials and builds no Kubernetes client: $kube" >&2; exit 1; }
 
+# The LLM rule (#4; tacplus-dev/roadmap decisions/skipper-and-admiral-2026-11-01.md, 2026-11-19): an LLM may propose;
+# it never holds a token or a write path. The gate's fixture test first, then the gate on src/: it fails if the triage
+# advisor's side (src/advisor/, src/core/proposal.rs) could reach a state client, a token or any write path.
+llm-rule:
+  scripts/llm-rule-gate-test.sh
+  scripts/llm-rule-gate.sh src
+
 # The gates every change passes before it lands.
-gates: system test
+gates: system llm-rule test

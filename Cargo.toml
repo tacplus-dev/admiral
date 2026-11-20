@@ -17,6 +17,11 @@ tracing = "0.1"
 async-trait = "0.1"
 # src/screen.rs: the Admiral's own screening of a report (the chassis logger already builds it).
 regex = "1"
+# Triage (#4): the advisor's typed proposals and its tool's input (src/core/proposal.rs), and each triage's nonce
+# (src/core/mod.rs). The generated chassis's lines, so the same crates.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
 
 [dev-dependencies]
 # src/api_tests.rs round-trips the API's messages, and checks who may open the stream with the generated

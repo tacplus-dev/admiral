@@ -35,6 +35,11 @@ import "sys/trace.proto";
 
 option (spec.service) = {name: "admiral"};
 
+// Triage's model, through llmproxy (#4): the core holds this client and gives
+// the advisor only completions through it (src/core/llmproxy.rs). The fleet
+// admits the Admiral to llmproxy by this declaration.
+option (spec.grpc_s2s_client) = {service: "llmproxy.LlmProxy"};
+
 // Config is delivered by kernel at startup and on every change. Empty until intake (#2) and the filing core (#5)
 // give it fields; it carries no credential of the cluster's, now or later.
 message Config {
