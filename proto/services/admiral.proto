@@ -10,19 +10,33 @@
 // cluster credentials (it never acts on the fleet; it only reads the deployment's redacted config). A prompt
 // injection through a Skipper's message must land in a process with neither.
 //
-// SCOPE OF THIS FILE, THE SCAFFOLD ONLY (#1): the service's identity, its Config and its state root. The
-// Skipper-Admiral stream and its typed messages are #3; intake, triage and filing (#2, #4, #5) follow.
+// THE SKIPPER-ADMIRAL API (#3): the typed messages both ways on the one stream each Skipper opens and holds to
+// its Admiral (the 2026-11-01 and 2026-11-19 addenda). The Skipper generates its client from this file
+// (skipper#3); the Admiral serves it (intake, #2; triage and filing, #4 and #5, follow).
+//
+// - Who talks to whom: a Skipper (tenant-owned, /tenants/<tid>/services/skipper) dials out to its Admiral, the
+//   allowed tenant -> /system direction. The Admiral never dials into a tenant: it reaches a Skipper only on the
+//   stream that Skipper opened, and treats a Skipper whose stream is down as unreachable. The tenant a message
+//   belongs to is the stream's authenticated caller, never a field.
+// - Every message from a Skipper is untrusted data to the Admiral (prompt-injection hardening,
+//   tacplus-dev/looper#40): it reaches the Admiral's LLM only inside nonce-keyed provenance blocks, never as
+//   instructions. Every bound below is enforced by the generated validation, on each message of the stream,
+//   before a handler sees it.
+// - What the Admiral sends is a request: the Skipper decides, by its own policy, whether and how to act, and
+//   answers or declines. The Admiral never reaches past the Skipper into the tenant's other services, and never
+//   asks for a fleet action (dropped, Jody 2026-11-19).
 
 syntax = "proto3";
 
 package admiral;
 
 import "sys/spec.proto";
+import "sys/trace.proto";
 
 option (spec.service) = {name: "admiral"};
 
-// Config is delivered by kernel at startup and on every change. Empty until the API (#3) and the filing
-// core (#5) give it fields; it carries no credential of the cluster's, now or later.
+// Config is delivered by kernel at startup and on every change. Empty until intake (#2) and the filing core (#5)
+// give it fields; it carries no credential of the cluster's, now or later.
 message Config {
   option (spec.grpc_config) = {service_name: "admiral"};
 }
@@ -32,4 +46,357 @@ message Config {
 // because kernel expects every service in the build to host one.
 message AdmiralState {
   option (spec.service_state) = {label: ["kernel"]};
+}
+
+// Admiral is the Admiral's Skipper-facing surface.
+service Admiral {
+  option (spec.service_s2s) = {};
+
+  // BrokerSkipperChannel is the Skipper's one long-lived stream to its
+  // Admiral. One per Skipper; a re-open replaces the old one (latest wins).
+  // The stream outlives one token: the generated S2S client carries it across
+  // tokens make-before-break (tacplus#259, tacplus#322).
+  //
+  // Order: the Skipper's first message is a SkipperHello; the Admiral answers
+  // with an AdmiralHello and then replays, for each report the hello names,
+  // the updates after the seq the Skipper says it holds. After that, either
+  // side sends at any time. A side that ends the stream on purpose (shutdown,
+  // drain) sets `last` on its final message, so the other side takes the end
+  // as a goodbye, not a fault; the Skipper reconnects with backoff either way.
+  rpc BrokerSkipperChannel(stream SkipperMessage) returns (stream AdmiralMessage) {
+    option (spec.rpc) = {principal: RPC_PRINCIPAL_SERVICE, auth_services: ["skipper"]};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The envelopes
+// ---------------------------------------------------------------------------
+
+// SkipperMessage is one message from a Skipper to its Admiral.
+message SkipperMessage {
+  oneof body {
+    SkipperHello hello = 1;
+    // report is a validated report, or a newer revision of one already sent.
+    Report report = 2;
+    // answer is the Skipper's answer to an AdmiralRequest.
+    RequestAnswer answer = 3;
+  }
+  // last is set on the Skipper's final message before it ends the stream on
+  // purpose. A message may carry only `last` (no body). It ends the logical
+  // stream: a token rotation's own `last` is in the generated envelope
+  // (tacplus#322) and never reaches this field.
+  bool last = 15;
+}
+
+// AdmiralMessage is one message from the Admiral to a Skipper.
+message AdmiralMessage {
+  oneof body {
+    AdmiralHello hello = 1;
+    // accepted acknowledges one revision of a report: it is recorded.
+    ReportAccepted accepted = 2;
+    // update is a step of a report's progress, for the Skipper to tell its
+    // reporter.
+    ReportUpdate update = 3;
+    // request asks the Skipper for something; the Skipper decides.
+    AdmiralRequest request = 4;
+  }
+  // last is set on the Admiral's final message before it ends the stream on
+  // purpose (shutdown, drain), as SkipperMessage.last.
+  bool last = 15;
+}
+
+// ---------------------------------------------------------------------------
+// Opening the stream
+// ---------------------------------------------------------------------------
+
+// SkipperHello opens the stream.
+message SkipperHello {
+  // skipper_version is the Skipper's release (e.g. "0.3.1"), so the Admiral
+  // knows what the other side can do.
+  string skipper_version = 1 [(spec.assert_max_size) = 64];
+  // open_reports are the reports the Skipper still keeps its reporters
+  // updated on, each with the last update seq it holds, so the Admiral
+  // replays what it missed while the stream was down.
+  repeated ReportCursor open_reports = 2 [(spec.assert_max_size) = 4096];
+}
+
+// ReportCursor is where a Skipper is in one report's updates.
+message ReportCursor {
+  string report_id = 1 [(spec.assert_required) = true, (spec.assert_max_size) = 64];
+  // last_seq is the last ReportUpdate.seq the Skipper holds for the report,
+  // 0 for none.
+  uint64 last_seq = 2;
+}
+
+// AdmiralHello answers a SkipperHello.
+message AdmiralHello {
+  string admiral_version = 1 [(spec.assert_max_size) = 64];
+  // unknown_reports are the report ids of the hello the Admiral holds no
+  // record of; the Skipper sends them again.
+  repeated string unknown_reports = 2 [(spec.assert_max_size) = 4096, (spec.assert_element_max_size) = 64];
+}
+
+// ---------------------------------------------------------------------------
+// The report (Skipper -> Admiral)
+// ---------------------------------------------------------------------------
+
+// Report is a user's report as the Skipper validated it. Every report
+// surfaces: validation sets its classification and confidence, never whether
+// it is sent. One not yet reproduced is sent too, with what the Skipper tried
+// and saw.
+//
+// It carries no tenant data beyond the evidence the Skipper chose to let
+// leave the tenant: secrets redacted, no other tenant's data, no reporter
+// identity. The Admiral checks that again before anything is filed.
+message Report {
+  // report_id is the Skipper's id for the report, unique within its tenant
+  // and opaque to the Admiral.
+  string report_id = 1 [(spec.assert_required) = true, (spec.assert_max_size) = 64];
+  // revision is 1 for the first sending and one more for each newer revision
+  // (a later reproduction, more evidence). The Admiral keeps the highest; a
+  // revision it already holds is acknowledged again and changes nothing.
+  uint32 revision = 2 [(spec.assert_ge) = 1];
+  // reported_at_ms is when the reporter reported it (Unix ms).
+  int64 reported_at_ms = 3;
+  // summary is what the reporter says goes wrong, in the Skipper's words.
+  string summary = 4 [(spec.assert_required) = true, (spec.assert_max_size) = 4096];
+  // symptom is the failure in typed form: what the Admiral groups by across
+  // tenants.
+  Symptom symptom = 5 [(spec.assert_required) = true];
+  Reproduction reproduction = 6 [(spec.assert_required) = true];
+  Evidence evidence = 7;
+  Classification classification = 8 [(spec.assert_required) = true];
+}
+
+// Symptom is what fails, with no tenant data: the part of a report that may
+// be compared across tenants.
+message Symptom {
+  // service is the service whose answer is wrong (its tacplus service name).
+  string service = 1 [(spec.assert_max_size) = 128];
+  // method is the rpc, "<package>.<Service>/<Method>", when one is known.
+  string method = 2 [(spec.assert_max_size) = 256];
+  // grpc_code is the gRPC status code seen (0 when the call succeeded with a
+  // wrong answer, or none applies).
+  int32 grpc_code = 3 [(spec.assert_ge) = 0, (spec.assert_le) = 16];
+  // http_status is the HTTP status seen at the gateway, 0 for none.
+  int32 http_status = 4 [(spec.assert_ge) = 0, (spec.assert_le) = 599];
+  // error is the error as returned, secrets and identifiers redacted.
+  string error = 5 [(spec.assert_max_size) = 1024];
+}
+
+// ReproductionStatus is whether the Skipper reproduced the report.
+enum ReproductionStatus {
+  REPRODUCTION_STATUS_UNSPECIFIED = 0;
+  // REPRODUCED: the minimal reproduction fails as reported, re-run.
+  REPRODUCTION_STATUS_REPRODUCED = 1;
+  // NOT_YET_REPRODUCED: the Skipper could not make it fail yet; `attempts`
+  // says what it tried and saw. Filed as "not yet reproduced", and watched.
+  REPRODUCTION_STATUS_NOT_YET_REPRODUCED = 2;
+}
+
+// Reproduction is a minimal reproduction against the tenant's own services,
+// with the tenant's own access.
+message Reproduction {
+  ReproductionStatus status = 1 [(spec.assert_enum_defined) = true];
+  // steps are the reproduction's calls, in order.
+  repeated Exchange steps = 2 [(spec.assert_max_size) = 64];
+  // runs is how many times the Skipper ran it, and failed how many of those
+  // failed as reported: a reproduction is re-run before it counts.
+  uint32 runs = 3;
+  uint32 failed = 4;
+  // attempts says what the Skipper tried and what it saw, for one not yet
+  // reproduced (and for any run that passed).
+  string attempts = 5 [(spec.assert_max_size) = 8192];
+}
+
+// Exchange is one request and its response, as JSON (proto3 JSON of the
+// generated messages), secrets redacted.
+message Exchange {
+  string method = 1 [(spec.assert_max_size) = 256];
+  string request_json = 2 [(spec.assert_max_size) = 65536];
+  string response_json = 3 [(spec.assert_max_size) = 65536];
+  int32 grpc_code = 4 [(spec.assert_ge) = 0, (spec.assert_le) = 16];
+  // call_trace_id is the call's trace, when it was traced. (Not `trace_id`:
+  // that is field 200, which tacplus injects into every message.)
+  string call_trace_id = 5 [(spec.assert_max_size) = 64];
+}
+
+// Evidence is what the Skipper gathered inside the tenant and decided may
+// leave it.
+message Evidence {
+  // exchanges are the reporter's own failing calls, as far as the Skipper
+  // has them (the reproduction's are in Reproduction.steps).
+  repeated Exchange exchanges = 1 [(spec.assert_max_size) = 64];
+  // trace_events are the trace events of the failing calls: typed, so the
+  // Admiral's sanitizing of them is generated and deterministic.
+  repeated trace.TraceEvent trace_events = 2 [(spec.assert_max_size) = 1024];
+  repeated LogLine logs = 3 [(spec.assert_max_size) = 1024];
+  // versions are the releases on the path as the tenant sees them.
+  repeated ComponentVersion versions = 4 [(spec.assert_max_size) = 256];
+}
+
+// LogLine is one log line, secrets and identifiers redacted.
+message LogLine {
+  string service = 1 [(spec.assert_max_size) = 128];
+  int64 timestamp_ms = 2;
+  string level = 3 [(spec.assert_max_size) = 16];
+  string text = 4 [(spec.assert_max_size) = 4096];
+}
+
+// ComponentVersion is one component's release.
+message ComponentVersion {
+  string component = 1 [(spec.assert_required) = true, (spec.assert_max_size) = 128];
+  string version = 2 [(spec.assert_max_size) = 64];
+}
+
+// Cause is where a report's cause lives.
+enum Cause {
+  CAUSE_UNSPECIFIED = 0;
+  // TENANT_CODE: the service's own user code (the tenant's or product's own
+  // logic, not the generated chassis): the common case.
+  CAUSE_TENANT_CODE = 1;
+  // PLATFORM_SERVICE: a tacplus-dev platform service.
+  CAUSE_PLATFORM_SERVICE = 2;
+  // GENERATOR: tacplus's generated code.
+  CAUSE_GENERATOR = 3;
+  // UNKNOWN: not classified yet (a report not yet reproduced, say).
+  CAUSE_UNKNOWN = 4;
+}
+
+// Classification is where a cause lives, and how sure its author is.
+message Classification {
+  Cause cause = 1 [(spec.assert_enum_defined) = true];
+  // component is the service or repository the cause is in, when known
+  // (e.g. "gateway", "tacplus").
+  string component = 2 [(spec.assert_max_size) = 128];
+  // confidence is 0 to 100.
+  uint32 confidence = 3 [(spec.assert_le) = 100];
+  string rationale = 4 [(spec.assert_max_size) = 4096];
+}
+
+// ---------------------------------------------------------------------------
+// Progress (Admiral -> Skipper)
+// ---------------------------------------------------------------------------
+
+// ReportAccepted says the Admiral recorded one revision of a report. A
+// Skipper that sees none resends the report on its next stream.
+message ReportAccepted {
+  string report_id = 1 [(spec.assert_required) = true, (spec.assert_max_size) = 64];
+  uint32 revision = 2 [(spec.assert_ge) = 1];
+}
+
+// Stage is a step of a report's way to resolution, in order. A report need
+// not pass every one (a report closed as a duplicate skips the fix stages).
+enum Stage {
+  STAGE_UNSPECIFIED = 0;
+  // RECEIVED: recorded, triage pending.
+  STAGE_RECEIVED = 1;
+  // TRIAGED: the Admiral classified it (Finding).
+  STAGE_TRIAGED = 2;
+  // FILED: filed in the repository that owns the cause (issue_url, when the
+  // issue is public).
+  STAGE_FILED = 3;
+  // GROUPED: grouped by symptom with other not yet reproduced reports.
+  STAGE_GROUPED = 4;
+  // ESCALATED: several of the same symptom became a bug of their own.
+  STAGE_ESCALATED = 5;
+  // FIX_LANDED: the fix is on the owning repository's main.
+  STAGE_FIX_LANDED = 6;
+  // FIX_RELEASED: the fix is in a release (release).
+  STAGE_FIX_RELEASED = 7;
+  // FIX_DEPLOYED: the fix reached this Skipper's deployment: what the
+  // Skipper tells the reporter, not the issue closing.
+  STAGE_FIX_DEPLOYED = 8;
+  // CLOSED: no further update (resolved, a duplicate, or not a bug: Finding
+  // says which).
+  STAGE_CLOSED = 9;
+}
+
+// ReportUpdate is one step of a report's progress. The Skipper tells it to
+// its reporter at the level its audience wants; this message stays fully
+// technical.
+message ReportUpdate {
+  string report_id = 1 [(spec.assert_required) = true, (spec.assert_max_size) = 64];
+  // seq is 1 for the report's first update and one more for each after it;
+  // a Skipper names the last one it holds in its SkipperHello.
+  uint64 seq = 2 [(spec.assert_ge) = 1];
+  Stage stage = 3 [(spec.assert_enum_defined) = true];
+  int64 at_ms = 4;
+  // finding is the Admiral's triage: where the cause was found, and what it
+  // found.
+  Finding finding = 5;
+  // issue_url is the public issue the report became, when there is one (a
+  // platform cause). The private triage record is never linked here.
+  string issue_url = 6 [(spec.assert_max_size) = 512];
+  // release is the release that carries the fix ("<component> <version>"),
+  // from FIX_RELEASED on.
+  string release = 7 [(spec.assert_max_size) = 192];
+}
+
+// Finding is what the Admiral found.
+message Finding {
+  Classification classification = 1;
+  // summary is the finding in technical words.
+  string summary = 2 [(spec.assert_max_size) = 4096];
+}
+
+// ---------------------------------------------------------------------------
+// The Admiral's requests (Admiral -> Skipper; the Skipper decides)
+// ---------------------------------------------------------------------------
+
+// AdmiralRequest asks the Skipper for something within the Skipper's own
+// privileges. The Skipper answers each with a RequestAnswer of the same
+// request_id, or declines it.
+message AdmiralRequest {
+  // request_id is the Admiral's id for the request, unique on the stream.
+  string request_id = 1 [(spec.assert_required) = true, (spec.assert_max_size) = 64];
+  oneof kind {
+    TenantConfigRequest tenant_config = 2;
+    ReproduceRequest reproduce = 3;
+  }
+}
+
+// TenantConfigRequest asks for the tenant's redacted config, for triage. The
+// Admiral never reads a tenant's config directly (decided 2026-11-02), and
+// does not store the answer.
+message TenantConfigRequest {
+  // report_id is the report the triage is for.
+  string report_id = 1 [(spec.assert_required) = true, (spec.assert_max_size) = 64];
+}
+
+// ReproduceRequest asks the Skipper to run a report's reproduction again
+// (after a fix reached the deployment, or to compare a symptom), and send the
+// result as a new revision of the report.
+message ReproduceRequest {
+  string report_id = 1 [(spec.assert_required) = true, (spec.assert_max_size) = 64];
+}
+
+// RequestAnswer is the Skipper's answer to one AdmiralRequest.
+message RequestAnswer {
+  string request_id = 1 [(spec.assert_required) = true, (spec.assert_max_size) = 64];
+  oneof outcome {
+    // declined: the Skipper's policy refused it; reason says why.
+    Declined declined = 2;
+    // tenant_config answers a TenantConfigRequest.
+    RedactedConfig tenant_config = 3;
+    // reproduced_revision answers a ReproduceRequest: the report's new
+    // revision is sent as its own SkipperMessage.report; this says which.
+    uint32 reproduced_revision = 4;
+  }
+}
+
+// Declined is a request the Skipper refused.
+message Declined {
+  string reason = 1 [(spec.assert_max_size) = 1024];
+}
+
+// RedactedConfig is a tenant's config's redacted twin (tacplus#274): never a
+// secret value; secret version references stay visible.
+message RedactedConfig {
+  // message_type is the twin's full proto name.
+  string message_type = 1 [(spec.assert_required) = true, (spec.assert_max_size) = 256];
+  // version is the config version it is.
+  int64 version = 2;
+  // value is the twin, protobuf binary encoded.
+  bytes value = 3 [(spec.assert_max_size) = 1048576];
 }

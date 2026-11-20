@@ -7,6 +7,21 @@ license = "Apache-2.0"
 [dependencies]
 admiral-model = { path = "target/generated-sources/model" }
 logger = { path = "target/generated-sources/model/chassis/logger" }
+# The generated handler traits take the verified caller (servicemanager::auth::Caller) and answer tonic::Status;
+# the Skipper channel's streams are futures::Streams (src/service.rs).
+servicemanager = { path = "target/generated-sources/model/chassis/servicemanager" }
+tonic = "0.14"
+futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 async-trait = "0.1"
+
+[dev-dependencies]
+# src/api_tests.rs round-trips the API's messages, and checks who may open the stream with the generated
+# Authorizer and signed fixture tokens, as tacplus-dev/skipper does: the same path crates, and the chassis's lines.
+prost = "0.14"
+token = { path = "target/generated-sources/model/chassis/token" }
+key = { path = "target/generated-sources/model/chassis/key" }
+jwk = { path = "target/generated-sources/model/chassis/jwk" }
+grpcserver = { path = "target/generated-sources/model/chassis/grpcserver" }
+base64 = "0.21"

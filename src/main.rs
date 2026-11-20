@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Jody Scott
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(test)]
+mod api_tests;
 mod service;
 
 use std::error::Error;

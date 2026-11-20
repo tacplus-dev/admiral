@@ -14,8 +14,17 @@ version = "0.1.0"
 dependencies = [
  "admiral-model",
  "async-trait",
+ "base64 0.21.7",
+ "futures",
+ "grpcserver",
+ "jwk",
+ "key",
  "logger",
+ "prost",
+ "servicemanager",
+ "token",
  "tokio",
+ "tonic",
  "tracing",
 ]
 
