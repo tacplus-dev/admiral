@@ -5,3 +5,4 @@ Append-only: add entries at the end, never edit or remove one (CI enforces it). 
 
 - 2026-11-19 jody decision Created, from the Skipper/Admiral huddles (tacplus-dev/roadmap decisions/skipper-and-admiral-2026-11-01.md)
 - 2026-11-20 looper issue Scaffold Admiral as a tacplus Rust service in /system: tacplus.yaml, its proto package, tacplus.lock pin, just gates (#1)
+- 2026-11-20 looper issue Declare the Skipper-Admiral API (the stream's typed messages) for both sides to generate (#3)
