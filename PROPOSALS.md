@@ -29,3 +29,12 @@ Loopers propose here; Jody decides, and an accepted proposal becomes a ROADMAP l
   the Skipper's and the Admiral's builds generate different sets of methods, so an `rpc` the Admiral's build does not
   know decodes as an unknown field. The design wants trace data typed (its sanitizing generated); if triage (#4) needs
   the method of every hop, a fleet-wide `AccountingMethod` (tacplus) or a method name beside it is the fix.
+- **The intake's reports outlive a restart only through the Skippers** (#2): the Admiral holds the reports in memory
+  (its state root is empty), so after a restart every hello names them as unknown and the Skippers send them again.
+  Once the filing core (#5) writes the private triage record, the intake can answer a hello from that record instead.
+- **A per-stream message rate and a hello deadline in the intake** (#2): a stream is bounded per message and a
+  tenant's held reports to 4096, but a Skipper may send revisions as fast as it likes, and a stream that never sends
+  its hello stays open. Rate-limit per tenant and close a stream with no hello within a deadline.
+- **Nonce-keyed provenance blocks for the triage advisor** (#4): the intake screens and holds a report but gives no
+  LLM any of its text. The advisor is where report text first meets a model; it must reach it only inside nonce-keyed
+  blocks (tacplus-dev/looper#40), with the intake's screening counts beside it.
