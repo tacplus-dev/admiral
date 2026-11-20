@@ -32,7 +32,7 @@ static SECRETS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 static TENANT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(\btenants/)([A-Za-z0-9._-]+)").unwrap());
 
 /// A user's identity: `/users/<user>` in a namespace or a SPIFFE id. A report carries no reporter identity.
-static USER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)(/users/)([^/\s"',}]+)"#).unwrap());
+static USER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(/users/)([A-Za-z0-9._@+-]+)").unwrap());
 
 /// The tenant a report comes from: the identifiers its Skipper's token names it by (its namespace's, and its
 /// SPIFFE id's when that names it otherwise). Any other tenant named in a report is another tenant's data.
