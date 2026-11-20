@@ -21,6 +21,7 @@ dependencies = [
  "key",
  "logger",
  "prost",
+ "regex",
  "servicemanager",
  "token",
  "tokio",

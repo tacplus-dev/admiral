@@ -17,8 +17,11 @@ Design: tacplus-dev/roadmap `decisions/skipper-and-admiral-2026-11-01.md`. Rust.
 A tacplus Rust service, generated from `proto/services/admiral.proto` (`tacplus.yaml`; the release and build image
 pinned in `tacplus.lock`). It is a platform service, not tenant-owned: the operator runs one instance per
 deployment, as `/system/services/admiral`. Generated code goes to `target/generated-sources` and is never
-committed. Today it is an empty service (a Config and a state root, no surface of its own); the Skipper-Admiral
-stream is #3.
+committed. Its one surface is the Skipper-Admiral stream (`admiral.Admiral/BrokerSkipperChannel`, #3), which the
+report intake serves (`src/intake.rs`, #2): only a tenant's Skipper may open it, the tenant is the Skipper's token's,
+each message is validated against the declared bounds, a report is screened again for secrets, other tenants'
+identifiers and users' identities (`src/screen.rs`) and held in memory, its highest revision, and every message is
+audited (log target `admiral::audit`, never a message's text).
 
 **Bring-up:** the operator, then llmproxy (the operator deploys it; the Admiral reaches models only through it),
 then the Admiral. Skippers connect to it once it is up.
