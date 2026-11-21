@@ -237,6 +237,9 @@ async fn a_symptom_groups_bug_is_filed_with_no_tenant_data() {
     let issues = f.tracker.issues.lock().unwrap();
     assert!(issues[0].issue.body.contains("Reported 3 times from 2 tenants"));
     assert!(f.project.traces().iter().all(|t| t == "trace-g"));
+    // A platform cause's group opens a public issue too: those calls carry the group's trace as well.
+    let tracker_traces = f.tracker.traces();
+    assert!(!tracker_traces.is_empty() && tracker_traces.iter().all(|t| t == "trace-g"), "{tracker_traces:?}");
 }
 
 // Retention: a record closes when its public issue does; 90 days after it closed, its evidence is purged and its

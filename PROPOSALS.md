@@ -64,3 +64,7 @@ Loopers propose here; Jody decides, and an accepted proposal becomes a ROADMAP l
   its API, so the `seabeam/triage` project access token sits in Secret Manager and rotates by hand (at most a year).
   When GitLab ships inbound workload identity federation (its WIF design doc; gitlab-org/gitlab#601894), the
   Admiral's own token could be exchanged for it, as the GitHub App's is minted, and the secret dropped.
+- **One fake forge API for the filing tests** (#6): `src/filing/fake_api.rs` serves the GitHub and GitLab clients'
+  tests and records each request's `X-Tacplus-Trace-Id`; `src/filing/credentials/tests.rs` keeps its own copy of the
+  same request reader (`Apis`, `Seen`). Moving the credentials' fake onto `fake_api` (an answer that can fail with a
+  status) would leave one reader to keep right.

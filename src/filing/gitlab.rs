@@ -130,3 +130,6 @@ impl TriageProject for GitLab {
         Ok(records)
     }
 }
+
+#[cfg(test)]
+mod tests;

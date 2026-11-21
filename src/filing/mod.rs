@@ -21,6 +21,8 @@
 //!   secret in its config.
 
 pub mod credentials;
+#[cfg(test)]
+mod fake_api;
 pub mod forge;
 pub mod github;
 pub mod gitlab;

@@ -84,3 +84,6 @@ impl PublicTracker for GitHub {
         Ok(issue["state"].as_str() == Some("open"))
     }
 }
+
+#[cfg(test)]
+mod tests;
