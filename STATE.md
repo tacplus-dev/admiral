@@ -2,7 +2,7 @@
 
 Last updated: 2026-11-20 by the looper (#5, filing).
 
-**Version:** none released; tacplus 2.6.13 pinned (`tacplus.lock`, floor 2.6).
+**Version:** none released; tacplus 2.6.16 pinned (`tacplus.lock`, floor 2.6).
 
 **What works:** a tacplus Rust service in /system: proto package `admiral` (an empty Config and state root, not
 tenant-owned: one instance per deployment, `/system/services/admiral`), registered as service 109
